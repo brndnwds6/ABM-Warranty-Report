@@ -1,7 +1,7 @@
 #!/bin/zsh
 
 # ==============================================================================
-# Script Name:  abm_warranty_report.zsh
+# Script Name:  warranty_wrangler.zsh
 # Author:       Brandon Woods
 # Date:         February 23, 2026
 #
@@ -10,10 +10,13 @@
 #                       the AppleCare+ expiration date when active coverage exists,
 #                       falling back to the Limited Warranty date for devices
 #                       without AppleCare. Credit: fpatafta (Jamf Nation Community)
+#   February 26, 2026 — Added Apple School Manager (ASM) support via --asm flag.
+#                       Switches API base URL and OAuth scope automatically.
+#                       Credit: MultiSiggloo (Jamf Nation Community)
 # ==============================================================================
 #
 # Pulls device and AppleCare / warranty coverage data from Apple Business
-# Manager and writes two MUT-compatible CSV files:
+# Manager (ABM) or Apple School Manager (ASM) and writes two MUT-compatible CSV files:
 #
 #   ComputerTemplate.csv     — Mac devices (productFamily = "Mac")
 #   MobileDeviceTemplate.csv — iPhone, iPad, Apple TV, iPod, Vision Pro, etc.
@@ -42,13 +45,16 @@
 #   - openssl + xxd (built-in on macOS)
 #
 # Usage:
-#   ./abm_warranty_report.zsh
-#   ./abm_warranty_report.zsh --key /path/to/key.pem \
+#   ./warranty_wrangler.zsh
+#   ./warranty_wrangler.zsh --key /path/to/key.pem \
 #                              --client-id BUSINESSAPI.xxxx \
 #                              --key-id xxxx \
 #                              --outdir /path/to/output/folder \
 #                              --computer-file MyMacs.csv \
 #                              --mobile-file MyMobileDevices.csv
+#   ./warranty_wrangler.zsh --asm \
+#                              --client-id SCHOOLAPI.xxxx \
+#                              --key-id xxxx
 # ==============================================================================
 
 # ---------- Configuration (edit these) ---------------------------------------
@@ -59,9 +65,11 @@ OUTPUT_DIR="."
 COMPUTER_FILENAME="ComputerTemplate.csv"
 MOBILE_FILENAME="MobileDeviceTemplate.csv"
 
-# API endpoints
+# API endpoints — overridden automatically when --asm flag is used
 ABM_AUTH_URL="https://account.apple.com/auth/oauth2/token"
 ABM_API_BASE="https://api-business.apple.com/v1"
+ABM_SCOPE="business.api"
+ASM_MODE=false
 
 # Pause between per-device coverage API calls to avoid rate limiting (seconds)
 RATE_LIMIT_DELAY=0.2
@@ -76,6 +84,7 @@ while [[ $# -gt 0 ]]; do
         --computer-file)   COMPUTER_FILENAME="$2";      shift 2 ;;
         --mobile-file)     MOBILE_FILENAME="$2";        shift 2 ;;
         --delay)           RATE_LIMIT_DELAY="$2";       shift 2 ;;
+        --asm)             ASM_MODE=true;               shift 1 ;;
         --help|-h)
             sed -n '3,38p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
@@ -88,6 +97,15 @@ done
 # Ensure filenames end in .csv
 [[ "$COMPUTER_FILENAME" != *.csv ]] && COMPUTER_FILENAME="${COMPUTER_FILENAME}.csv"
 [[ "$MOBILE_FILENAME"   != *.csv ]] && MOBILE_FILENAME="${MOBILE_FILENAME}.csv"
+
+# Override API base and scope for Apple School Manager
+if [[ "$ASM_MODE" == true ]]; then
+    ABM_API_BASE="https://api-school.apple.com/v1"
+    ABM_SCOPE="school.api"
+    echo "-> Mode: Apple School Manager (ASM)"
+else
+    echo "-> Mode: Apple Business Manager (ABM)"
+fi
 
 COMPUTER_CSV="${OUTPUT_DIR}/${COMPUTER_FILENAME}"
 MOBILE_CSV="${OUTPUT_DIR}/${MOBILE_FILENAME}"
@@ -199,7 +217,7 @@ echo "-> Requesting bearer token..."
 tokenResponse=$(curl -s -w "\n__STATUS__%{http_code}" -X POST \
     -H "Host: account.apple.com" \
     -H "Content-Type: application/x-www-form-urlencoded" \
-    "${ABM_AUTH_URL}?grant_type=client_credentials&client_id=${ABM_CLIENT_ID}&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion=${clientAssertion}&scope=business.api")
+    "${ABM_AUTH_URL}?grant_type=client_credentials&client_id=${ABM_CLIENT_ID}&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion=${clientAssertion}&scope=${ABM_SCOPE}")
 
 httpStatus=$(echo "$tokenResponse" | grep '__STATUS__' | sed 's/__STATUS__//')
 tokenBody=$(echo "$tokenResponse" | grep -v '__STATUS__')
@@ -386,7 +404,11 @@ newDevicesTotal=$(( newComputerCount + newMobileCount ))
 
 echo ""
 echo "============================================"
-echo " ABM Warranty Report Complete"
+if [[ "$ASM_MODE" == true ]]; then
+    echo " ASM Warranty Recon Complete"
+else
+    echo " ABM Warranty Recon Complete"
+fi
 echo "============================================"
 echo " Total devices in ABM : $totalDevices"
 echo " Already in CSV       : $skippedCount (skipped)"
@@ -397,7 +419,11 @@ echo "============================================"
 
 if [[ $newDevicesTotal -eq 0 ]]; then
     echo ""
-    echo " No new devices were found in ABM."
+    if [[ "$ASM_MODE" == true ]]; then
+        echo " No new devices were found in ASM."
+    else
+        echo " No new devices were found in ABM."
+    fi
     echo " Both CSV files are already up to date."
     echo "============================================"
 fi
