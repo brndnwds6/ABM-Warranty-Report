@@ -4,15 +4,27 @@
 # Script Name:  warranty_wrangler.zsh
 # Author:       Brandon Woods
 # Date:         February 23, 2026
+# Version:      1.2.1
 #
 # Changelog:
-#   February 25, 2026 — Added AppleCare+ support. Warranty Expires now reflects
-#                       the AppleCare+ expiration date when active coverage exists,
-#                       falling back to the Limited Warranty date for devices
-#                       without AppleCare. Credit: fpatafta (Jamf Nation Community)
-#   February 26, 2026 — Added Apple School Manager (ASM) support via --asm flag.
-#                       Switches API base URL and OAuth scope automatically.
-#                       Credit: MultiSiggloo (Jamf Nation Community)
+#   1.1.0 — February 25, 2026
+#           Added AppleCare+ support. Warranty Expires now reflects the
+#           AppleCare+ expiration date when active coverage exists, falling
+#           back to the Limited Warranty date for devices without AppleCare.
+#           Credit: fpatafta (Jamf Nation Community)
+#
+#   1.2.0 — February 26, 2026
+#           Added Apple School Manager (ASM) support via --asm flag. Switches
+#           API base URL and OAuth scope automatically.
+#           Credit: MultiSiggloo (Jamf Nation Community)
+#
+#   1.2.1 — March 26, 2026
+#           Fixed rate limiting error (HTTP 429 / "Failed to fetch device
+#           list") occurring on reruns when all devices are already in the CSV.
+#           Page fetches now include a brief delay between requests and will
+#           retry up to 3 times with increasing back-off on 429 responses.
+#           HTTP status is now captured and printed on failure for easier
+#           diagnosis. Credit: BR_TCTX, Steve_Xu (Jamf Nation Community)
 # ==============================================================================
 #
 # Pulls device and AppleCare / warranty coverage data from Apple Business
@@ -275,14 +287,35 @@ while true; do
         pageUrl="${ABM_API_BASE}/orgDevices"
     fi
 
-    pageResponse=$(curl -sf \
-        -H "Authorization: Bearer ${accessToken}" \
-        "$pageUrl")
+    # Fetch device page — capture HTTP status separately so failures are diagnosable.
+    # Retries up to 3 times on rate limiting (HTTP 429) with an increasing back-off.
+    pageResponse=""
+    pageHttpStatus=""
+    retryCount=0
+    while true; do
+        pageRaw=$(curl -s -w "\n__STATUS__%{http_code}" \
+            -H "Authorization: Bearer ${accessToken}" \
+            "$pageUrl")
+        pageHttpStatus=$(echo "$pageRaw" | grep '__STATUS__' | sed 's/__STATUS__//')
+        pageResponse=$(echo "$pageRaw" | grep -v '__STATUS__')
 
-    if [[ $? -ne 0 ]]; then
-        echo "ERROR: Failed to fetch device list (page $pageCount)" >&2
-        exit 1
-    fi
+        if [[ "$pageHttpStatus" == "200" ]]; then
+            break
+        elif [[ "$pageHttpStatus" == "429" && $retryCount -lt 3 ]]; then
+            retryCount=$(( retryCount + 1 ))
+            backoff=$(( retryCount * 10 ))
+            echo "  Rate limited (HTTP 429) on page $pageCount — waiting ${backoff}s before retry $retryCount/3..." >&2
+            sleep "$backoff"
+        else
+            echo "ERROR: Failed to fetch device list (page $pageCount) — HTTP $pageHttpStatus" >&2
+            echo "$pageResponse" >&2
+            exit 1
+        fi
+    done
+
+    # Brief pause between page fetches to avoid rate limiting, even when all
+    # devices are being skipped and no coverage calls are being made.
+    sleep "$RATE_LIMIT_DELAY"
 
     pageDeviceCount=$(echo "$pageResponse" | jq '.data | length')
     echo "  Page $pageCount: $pageDeviceCount devices"
