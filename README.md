@@ -9,9 +9,9 @@ This guide walks through everything needed to run `warranty_wrangler.zsh`, a scr
 - A Mac running macOS
 - Administrator access to Apple Business Manager or Apple School Manager
 - [`jq`](https://jqlang.org) installed — if you don't have it, install it with [Homebrew](https://brew.sh):
-  ```
+```
   brew install jq
-  ```
+```
 - `openssl`, `curl`, and `xxd` — all included with macOS by default
 
 ---
@@ -91,26 +91,28 @@ chmod +x ~/abm-warranty/warranty_wrangler.zsh
 Open the script in a text editor to fill in your credentials and paths. You can use:
 
 - **Terminal** with a built-in editor:
-  ```zsh
-  nano ~/abm-warranty/warranty_wrangler.zsh
-  ```
+```zsh
+nano ~/abm-warranty/warranty_wrangler.zsh
+```
 - **Visual Studio Code:**
-  ```zsh
-  code ~/abm-warranty/warranty_wrangler.zsh
-  ```
+```zsh
+code ~/abm-warranty/warranty_wrangler.zsh
+```
 - **CodeRunner** — open the file from the working directory
 
 Find the configuration block near the top of the script:
 
 ```zsh
 # ---------- Configuration (edit these) ---------------------------------------
-ABM_PRIVATE_KEY_PATH="/path/to/private-key.pem"
-ABM_CLIENT_ID="BUSINESSAPI.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-ABM_KEY_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-OUTPUT_DIR="."
-COMPUTER_FILENAME="ComputerTemplate.csv"
-MOBILE_FILENAME="MobileDeviceTemplate.csv"
+ABM_PRIVATE_KEY_PATH=&quot;/path/to/private-key.pem&quot;
+ABM_CLIENT_ID=&quot;BUSINESSAPI.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx&quot;
+ABM_KEY_ID=&quot;xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx&quot;
+OUTPUT_DIR=&quot;.&quot;
+COMPUTER_FILENAME=&quot;ComputerTemplate.csv&quot;
+MOBILE_FILENAME=&quot;MobileDeviceTemplate.csv&quot;
 ASM_MODE=false
+RATE_LIMIT_DELAY=0.3
+PAGE_FETCH_DELAY=2
 ```
 
 Replace each placeholder with your actual values:
@@ -124,6 +126,8 @@ Replace each placeholder with your actual values:
 | `COMPUTER_FILENAME` | Name for the Mac CSV file (default: `ComputerTemplate.csv`) |
 | `MOBILE_FILENAME` | Name for the mobile device CSV file (default: `MobileDeviceTemplate.csv`) |
 | `ASM_MODE` | Set to `true` if using Apple School Manager, leave as `false` for Apple Business Manager |
+| `RATE_LIMIT_DELAY` | Pause in seconds between per-device coverage API calls (default: `0.3`) |
+| `PAGE_FETCH_DELAY` | Pause in seconds between page-level device list fetches (default: `2`) |
 
 Save and close the file when done.
 
@@ -155,8 +159,27 @@ All configurable options are also available as flags:
   --key-id xxxx \
   --outdir /path/to/output \
   --computer-file MyMacs.csv \
-  --mobile-file MyMobileDevices.csv
+  --mobile-file MyMobileDevices.csv \
+  --delay 0.5 \
+  --page-delay 3
 ```
+
+#### Flag Reference
+
+| Flag | Description | Default |
+|---|---|---|
+| `--key` | Path to the `.pem` private key file | Value in config block |
+| `--client-id` | ABM/ASM API Client ID | Value in config block |
+| `--key-id` | ABM/ASM API Key ID | Value in config block |
+| `--outdir` | Directory to write CSV files to | `.` (current directory) |
+| `--computer-file` | Filename for the Mac CSV | `ComputerTemplate.csv` |
+| `--mobile-file` | Filename for the mobile device CSV | `MobileDeviceTemplate.csv` |
+| `--asm` | Use Apple School Manager endpoints instead of ABM | Off (ABM mode) |
+| `--delay` | Seconds to wait between per-device coverage API calls | `0.3` |
+| `--page-delay` | Seconds to wait between page-level device list fetches | `2` |
+| `--help`, `-h` | Print the script header documentation and exit | — |
+
+> **Tip:** If you're hitting rate limits (HTTP 429 errors), try increasing `--page-delay` to `3` or `4`. If individual device coverage calls are also being throttled, increase `--delay` to `0.5` or higher.
 
 ### Running from CodeRunner
 
@@ -208,6 +231,16 @@ The script is designed to be run repeatedly as new devices are added to ABM or A
 
 This means you can run the script on a regular schedule and the CSVs will grow over time to reflect your fleet without duplication.
 
+### Rate-limiting and retries
+
+The Apple API enforces rate limits on requests. The script handles this in several ways:
+
+- **Page-level throttling** — a configurable delay (`PAGE_FETCH_DELAY`, default 2 seconds) is applied between each page of devices fetched from the API. When an entire page of devices is skipped (already in CSV), an additional delay is added since no per-device coverage calls provide natural spacing.
+- **Per-device throttling** — a configurable delay (`RATE_LIMIT_DELAY`, default 0.3 seconds) is applied between each individual device coverage API call.
+- **Automatic retries** — both page fetches and per-device coverage calls will retry up to 3 times on HTTP 429 (rate limited) responses, with increasing back-off. The `Retry-After` header is honored when the server provides one.
+- **Early exit** — on incremental runs, if the number of known serials already matches the total device count reported by the API, the script exits immediately without fetching any pages.
+- **Token expiry detection** — the bearer token is valid for approximately 1 hour. The script warns at ~50 minutes of runtime and exits at ~58 minutes to prevent silent authentication failures on very large organizations.
+
 ---
 
 ## Apple School Manager vs. Apple Business Manager
@@ -246,8 +279,8 @@ If you want to use different filenames for the generated CSVs — for example, t
 
 ```zsh
 ./warranty_wrangler.zsh \
-  --computer-file "Macs_$(date +%Y-%m-%d).csv" \
-  --mobile-file "Mobile_$(date +%Y-%m-%d).csv"
+  --computer-file &quot;Macs_$(date +%Y-%m-%d).csv&quot; \
+  --mobile-file &quot;Mobile_$(date +%Y-%m-%d).csv&quot;
 ```
 
 You can also change `COMPUTER_FILENAME` and `MOBILE_FILENAME` directly in the configuration block at the top of the script.
@@ -263,6 +296,10 @@ You can also change `COMPUTER_FILENAME` and `MOBILE_FILENAME` directly in the co
 **"Token request failed"** — verify that your `ABM_CLIENT_ID` and `ABM_KEY_ID` match exactly what is shown in the API account management screen. Both values are case-sensitive. If using ASM, confirm that `ASM_MODE=true` is set or the `--asm` flag was passed — using a `SCHOOLAPI.` Client ID without ASM mode enabled will cause an auth failure.
 
 **"jq not found"** — install jq with `brew install jq` and re-run the script.
+
+**Frequent HTTP 429 (rate limited) errors** — increase the delay between requests by passing `--page-delay 4` and/or `--delay 0.5`. The default values (`PAGE_FETCH_DELAY=2`, `RATE_LIMIT_DELAY=0.3`) work well for most environments, but organizations with very large device counts or shared API rate limits may need higher values.
+
+**"Bearer token is about to expire"** — the bearer token is valid for approximately 1 hour. If your organization has enough devices that the script runs longer than ~58 minutes, it will exit to prevent auth failures. Simply re-run the script — incremental mode will pick up where it left off, skipping devices already in the CSV.
 
 **Warranty fields are blank in Jamf after MUT import** — confirm that the column headers in the CSV match the field names in Jamf Pro exactly. The script uses MUT's default column names, so no changes should be needed on a standard Jamf setup.
 
