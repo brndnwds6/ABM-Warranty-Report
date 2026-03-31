@@ -4,7 +4,7 @@
 # Script Name:  warranty_wrangler.zsh
 # Author:       Brandon Woods
 # Date:         February 23, 2026
-# Version:      1.2.1
+# Version:      1.3.0
 #
 # Changelog:
 #   1.1.0 — February 25, 2026
@@ -25,6 +25,20 @@
 #           retry up to 3 times with increasing back-off on 429 responses.
 #           HTTP status is now captured and printed on failure for easier
 #           diagnosis. Credit: BR_TCTX, Steve_Xu (Jamf Nation Community)
+#
+#   1.3.0 — March 31, 2026
+#           Improved rate-limiting resilience:
+#           - Separate PAGE_FETCH_DELAY (default 2s) between page fetches so
+#             skipped pages no longer hammer the API.
+#           - Adaptive extra delay when an entire page has no new devices.
+#           - Coverage API calls now retry up to 3x on HTTP 429 instead of
+#             silently failing.
+#           - Retry-After header honored on 429 responses when available.
+#           - Early exit when known serial count >= ABM org total.
+#           - Bearer token expiry warning after ~50 minutes of runtime.
+#           - Added --page-delay CLI flag.
+#           - Default RATE_LIMIT_DELAY increased from 0.2s to 0.3s.
+#           - Enabled PIPE_FAIL for more reliable error detection.
 # ==============================================================================
 #
 # Pulls device and AppleCare / warranty coverage data from Apple Business
@@ -69,6 +83,8 @@
 #                              --key-id xxxx
 # ==============================================================================
 
+setopt PIPE_FAIL
+
 # ---------- Configuration (edit these) ---------------------------------------
 ABM_PRIVATE_KEY_PATH="/path/to/private-key.pem"
 ABM_CLIENT_ID="BUSINESSAPI.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
@@ -84,7 +100,10 @@ ABM_SCOPE="business.api"
 ASM_MODE=false
 
 # Pause between per-device coverage API calls to avoid rate limiting (seconds)
-RATE_LIMIT_DELAY=0.2
+RATE_LIMIT_DELAY=0.3
+
+# Pause between page-level device-list fetches (seconds)
+PAGE_FETCH_DELAY=2
 
 # ---------- Parse command-line flags -----------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -96,9 +115,10 @@ while [[ $# -gt 0 ]]; do
         --computer-file)   COMPUTER_FILENAME="$2";      shift 2 ;;
         --mobile-file)     MOBILE_FILENAME="$2";        shift 2 ;;
         --delay)           RATE_LIMIT_DELAY="$2";       shift 2 ;;
+        --page-delay)      PAGE_FETCH_DELAY="$2";       shift 2 ;;
         --asm)             ASM_MODE=true;               shift 1 ;;
         --help|-h)
-            sed -n '3,38p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '3,84p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *)
             echo "Unknown option: $1" >&2
@@ -179,6 +199,10 @@ base64url() {
     openssl base64 -A | tr '+/' '-_' | tr -d '='
 }
 
+# ---------- Temp file for response headers (cleaned up on exit) --------------
+headerTmpFile=$(mktemp)
+trap "rm -f '$headerTmpFile'" EXIT INT TERM
+
 # ---------- Step 1: Build and sign the JWT client assertion -------------------
 echo "-> Generating JWT client assertion..."
 
@@ -247,6 +271,7 @@ if [[ -z "$accessToken" ]]; then
     exit 1
 fi
 
+tokenObtainedAt=$(date -u +%s)
 echo "  OK Bearer token obtained (valid ~1 hour)"
 
 # ---------- Step 3: Initialize output files -----------------------------------
@@ -281,6 +306,15 @@ pageCount=0
 while true; do
     pageCount=$(( pageCount + 1 ))
 
+    # --- Token expiry check ---------------------------------------------------
+    tokenAge=$(( $(date -u +%s) - tokenObtainedAt ))
+    if [[ $tokenAge -ge 3480 ]]; then
+        echo "ERROR: Bearer token is about to expire (~58 min elapsed). Re-run the script to continue." >&2
+        exit 1
+    elif [[ $tokenAge -ge 3000 ]]; then
+        echo "  WARNING: Bearer token age is $(( tokenAge / 60 )) min — approaching 1-hour expiry"
+    fi
+
     if [[ -n "$nextCursor" ]]; then
         pageUrl="${ABM_API_BASE}/orgDevices?cursor=${nextCursor}"
     else
@@ -288,12 +322,13 @@ while true; do
     fi
 
     # Fetch device page — capture HTTP status separately so failures are diagnosable.
-    # Retries up to 3 times on rate limiting (HTTP 429) with an increasing back-off.
+    # Retries up to 3 times on rate limiting (HTTP 429) with increasing back-off.
+    # Honors Retry-After header when available.
     pageResponse=""
     pageHttpStatus=""
     retryCount=0
     while true; do
-        pageRaw=$(curl -s -w "\n__STATUS__%{http_code}" \
+        pageRaw=$(curl -s -D "$headerTmpFile" -w "\n__STATUS__%{http_code}" \
             -H "Authorization: Bearer ${accessToken}" \
             "$pageUrl")
         pageHttpStatus=$(echo "$pageRaw" | grep '__STATUS__' | sed 's/__STATUS__//')
@@ -303,7 +338,12 @@ while true; do
             break
         elif [[ "$pageHttpStatus" == "429" && $retryCount -lt 3 ]]; then
             retryCount=$(( retryCount + 1 ))
-            backoff=$(( retryCount * 10 ))
+            retryAfter=$(grep -i '^Retry-After:' "$headerTmpFile" 2>/dev/null | awk '{print $2}' | tr -d '\r')
+            if [[ -n "$retryAfter" && "$retryAfter" =~ ^[0-9]+$ ]]; then
+                backoff=$retryAfter
+            else
+                backoff=$(( retryCount * 10 ))
+            fi
             echo "  Rate limited (HTTP 429) on page $pageCount — waiting ${backoff}s before retry $retryCount/3..." >&2
             sleep "$backoff"
         else
@@ -313,12 +353,27 @@ while true; do
         fi
     done
 
-    # Brief pause between page fetches to avoid rate limiting, even when all
+    # Pause between page fetches to avoid rate limiting, even when all
     # devices are being skipped and no coverage calls are being made.
-    sleep "$RATE_LIMIT_DELAY"
+    sleep "$PAGE_FETCH_DELAY"
 
     pageDeviceCount=$(echo "$pageResponse" | jq '.data | length')
     echo "  Page $pageCount: $pageDeviceCount devices"
+
+    # --- Early exit: if first page shows all devices are already known --------
+    if [[ $pageCount -eq 1 ]]; then
+        totalInOrg=$(echo "$pageResponse" | jq -r '.meta.paging.total // 0')
+        knownTotal=$(( ${#knownComputerSerials} + ${#knownMobileSerials} ))
+        if [[ $totalInOrg -gt 0 && $knownTotal -ge $totalInOrg ]]; then
+            echo "  All $totalInOrg devices already in CSV — nothing to do."
+            totalDevices=$totalInOrg
+            skippedCount=$totalInOrg
+            break
+        fi
+    fi
+
+    # Track how many new devices are found on this page
+    pageNewCount=0
 
     while IFS= read -r serial \
        && IFS= read -r productFamily \
@@ -345,6 +400,8 @@ while true; do
             newMobileCount=$(( newMobileCount + 1 ))
         fi
 
+        pageNewCount=$(( pageNewCount + 1 ))
+
         # Normalize null jq values to empty string
         [[ "$orderNumber"        == "null" ]] && orderNumber=""
         [[ "$purchaseSourceType" == "null" ]] && purchaseSourceType=""
@@ -355,12 +412,36 @@ while true; do
 
         echo "  New device: $serial ($productFamily)"
 
-        # Fetch AppleCare coverage for this device
-        coverageResponse=$(curl -sf \
-            -H "Authorization: Bearer ${accessToken}" \
-            "${ABM_API_BASE}/orgDevices/${serial}/appleCareCoverage")
+        # Fetch AppleCare coverage — retries up to 3 times on HTTP 429
+        coverageResponse=""
+        coverageStatus=""
+        coverageRetry=0
+        while true; do
+            coverageRaw=$(curl -s -D "$headerTmpFile" -w "\n__STATUS__%{http_code}" \
+                -H "Authorization: Bearer ${accessToken}" \
+                "${ABM_API_BASE}/orgDevices/${serial}/appleCareCoverage")
+            coverageStatus=$(echo "$coverageRaw" | grep '__STATUS__' | sed 's/__STATUS__//')
+            coverageResponse=$(echo "$coverageRaw" | grep -v '__STATUS__')
 
-        if [[ $? -ne 0 ]]; then
+            if [[ "$coverageStatus" == "200" ]]; then
+                break
+            elif [[ "$coverageStatus" == "429" && $coverageRetry -lt 3 ]]; then
+                coverageRetry=$(( coverageRetry + 1 ))
+                retryAfter=$(grep -i '^Retry-After:' "$headerTmpFile" 2>/dev/null | awk '{print $2}' | tr -d '\r')
+                if [[ -n "$retryAfter" && "$retryAfter" =~ ^[0-9]+$ ]]; then
+                    backoff=$retryAfter
+                else
+                    backoff=$(( coverageRetry * 10 ))
+                fi
+                echo "    Rate limited on coverage for $serial — waiting ${backoff}s (retry $coverageRetry/3)..." >&2
+                sleep "$backoff"
+            else
+                coverageResponse=""
+                break
+            fi
+        done
+
+        if [[ -z "$coverageResponse" || "$coverageStatus" != "200" ]]; then
             # Coverage unavailable — write serial and PO fields, leave warranty blank
             if [[ "$productFamily" == "Mac" ]]; then
                 printf '"%s",,,,,,,,,,,,,"%s","%s",,"%s",,,,,\n' \
@@ -378,13 +459,13 @@ while true; do
         # fall back to Limited Warranty end date if no active AppleCare coverage exists.
         # Credit: fpatafta (Jamf Nation Community, February 25, 2026)
         warrantyExpires=$(echo "$coverageResponse" | jq -r '
-            [ .data[] | select(.attributes.description != "Limited Warranty" and .attributes.status == "ACTIVE") ]
+            [ .data // [] | .[] | select(.attributes.description != "Limited Warranty" and .attributes.status == "ACTIVE") ]
             | first
             | .attributes.endDateTime // ""')
 
         if [[ -z "$warrantyExpires" || "$warrantyExpires" == "null" ]]; then
             warrantyExpires=$(echo "$coverageResponse" | jq -r '
-                [ .data[] | select(.attributes.description == "Limited Warranty") ]
+                [ .data // [] | .[] | select(.attributes.description == "Limited Warranty") ]
                 | first
                 | .attributes.endDateTime // ""')
         fi
@@ -392,7 +473,7 @@ while true; do
 
         # AppleCare agreement number -> AppleCare ID (prefer ACTIVE entry)
         applecareID=$(echo "$coverageResponse" | jq -r '
-            [ .data[] | select(.attributes.description != "Limited Warranty") ]
+            [ .data // [] | .[] | select(.attributes.description != "Limited Warranty") ]
             | sort_by(.attributes.status == "ACTIVE" | not)
             | first
             | .attributes.agreementNumber // ""')
@@ -425,6 +506,13 @@ while true; do
         (.attributes.purchaseSourceType // "null"),
         (.attributes.orderDateTime // "null")
     )')
+
+    # Adaptive delay: if no new devices were processed on this page, add extra
+    # pause since no per-device coverage calls provided natural throttling.
+    if [[ $pageNewCount -eq 0 && $pageDeviceCount -gt 0 ]]; then
+        echo "  (All devices on page $pageCount already known — throttling)"
+        sleep "$PAGE_FETCH_DELAY"
+    fi
 
     echo "  Page $pageCount complete — New: $newComputerCount computers, $newMobileCount mobile | Skipped: $skippedCount | Errors: $errorCount"
 
